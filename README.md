@@ -17,4 +17,4 @@ on equilibrium-based decoding and incentive flips.
 All experiments use fixed random seeds and matched candidate budgets.
 
 ## Contact
-Jueyi Yang
+Juyi Yang
