@@ -1,0 +1,794 @@
+# === One-cell runner (paper-aligned, optimized for Colab/T4) ===
+# - 更少重复 forward：对选项做 batch logprob
+# - 判别器结果加缓存，避免重复算
+# - FAST_SANITY_RUN：默认只跑小规模数据 + 较少迭代，先确保能跑通
+# --------------------------------------------------------
+
+# 安装依赖（Colab）
+!pip -q install "transformers>=4.44" "accelerate>=0.33" "datasets>=2.19" bitsandbytes matplotlib numpy > /dev/null
+
+import os, math, json, numpy as np, torch, gc, time, random
+import matplotlib; matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+from datasets import load_dataset
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+
+# ---------------- 基本配置（如需改，优先改这里） ----------------
+MODEL_NAME = "meta-llama/Llama-2-7b-hf"   # LLaMA-2 7B base
+USE_4BIT   = True                         # 显存不够可 True；与论文对齐建议 False (FP16)
+GPU_MEM_GB = 10                           # T4 建议 8~10
+CPU_MEM_GB = 64
+SEED       = 123
+
+# 评测/绘图参数
+RET_K    = 3
+BINS_ECE = 15
+
+# 数据规模（更快 -> 往下调；更稳 -> 适度调大）
+ARC_N     = 150
+# MMLU：8 门课，覆盖理工 / 社科 / 法律 / 人文
+MMLU_SUBJ = [
+    "econometrics",
+    "college_biology",
+    "college_computer_science",
+    "virology",
+    "college_physics",
+    "college_chemistry",
+    "high_school_us_history",
+    "professional_law",
+]
+MMLU_PER  = 15
+TQA_N     = 150
+
+# ===== 论文口径：步长/迭代 =====
+# 论文统一 η_D=λ_D=η_G=λ_G=0.1, T=5000；这里把 ALPHA/KAPPA 对应成 0.1
+FAST_SANITY_RUN = False   # ⚠ 默认 True：适合 T4 快速 sanity check，想跑 full 再改为 False
+
+ALPHA   = 0.1
+KAPPA   = 0.1
+T_ITERS = 300
+
+# competing 压测的“尖锐度”（只影响 adv 态下 G 的反向跟随；与主表无关）
+BETA_ADV = 1.2
+
+# 论文不做 G/D 混合，这里强制 0
+GAMMA    = 0.0
+
+# coop/adv 统一使用同一 ER 变体，建议 "ER-D"（或切到 "ER-G" 再单独跑一版）
+ER_VARIANT = "ER-D"  # "ER-D" or "ER-G"
+
+# ---- 根据 FAST_SANITY_RUN 自动降规模 ----
+if FAST_SANITY_RUN:
+    ARC_N     = min(ARC_N, 40)
+    MMLU_PER  = min(MMLU_PER, 6)
+    TQA_N     = min(TQA_N, 40)
+    T_ITERS   = min(T_ITERS, 80)
+    print("[Config] FAST_SANITY_RUN = True -> small datasets + fewer SBR iterations")
+else:
+    print("[Config] FAST_SANITY_RUN = False -> full (slower, closer to paper)")
+
+# --------------------------------------------------------
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF","expandable_segments:True")
+torch.backends.cuda.matmul.allow_tf32 = True
+
+def set_seed(s=SEED):
+    random.seed(s)
+    np.random.seed(s)
+    torch.manual_seed(s)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(s)
+
+set_seed()
+
+def print_mem(tag=""):
+    if not torch.cuda.is_available():
+        print(f"{tag} CPU only")
+        return
+    r = torch.cuda.memory_reserved()/(1024**3)
+    a = torch.cuda.memory_allocated()/(1024**3)
+    t = torch.cuda.get_device_properties(0).total_memory/(1024**3)
+    print(f"{tag} CUDA total={t:.2f} GB, reserved={r:.2f} GB, allocated={a:.2f} GB, free~={t-r:.2f} GB")
+
+def free_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
+
+# ---------------- 加载模型（4-bit + offload-friendly） ----------------
+def load_model(model_name=MODEL_NAME, use_4bit=USE_4BIT, gpu_mem_gb=GPU_MEM_GB, cpu_mem_gb=CPU_MEM_GB):
+    print_mem("[before load]")
+    dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    quant_config = None
+    if use_4bit:
+        quant_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=(torch.bfloat16 if torch.cuda.is_available() else torch.float32),
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+
+    max_mem = (
+        {0: f"{gpu_mem_gb}GiB", "cpu": f"{cpu_mem_gb}GiB"}
+        if torch.cuda.is_available()
+        else {"cpu": f"{cpu_mem_gb}GiB"}
+    )
+
+    tok = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+    mdl = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        torch_dtype=dtype,
+        max_memory=max_mem,
+        low_cpu_mem_usage=True,
+        quantization_config=quant_config,
+    ).eval()
+
+    print_mem("[after load]")
+    return tok, mdl
+
+tokenizer, model = load_model()
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
+# ---------------- 优化版：一次性算完所有选项的 log P(option | prefix) ----------------
+@torch.inference_mode()
+def logprobs_for_options(prefix: str, options):
+    """
+    返回一个长度为 len(options) 的 numpy 数组，每个元素是 log P(option | prefix)。
+    这里对所有 options 一次性 batch 进模型，减少 forward 次数。
+    """
+    dev = model.device
+    tok = tokenizer
+
+    # encode prefix 一次
+    enc_pref = tok(prefix, return_tensors="pt", add_special_tokens=False)
+    enc_pref = {k: v.to(dev) for k, v in enc_pref.items()}
+    pref_ids = enc_pref["input_ids"][0]
+    Lp = pref_ids.size(0)
+
+    # encode options（只编码 option 本身）
+    enc_opt = tok(
+        list(options),
+        return_tensors="pt",
+        add_special_tokens=False,
+        padding=True,
+    )
+    opt_ids  = enc_opt["input_ids"].to(dev)       # [B, Lopt_max]
+    opt_mask = enc_opt["attention_mask"].to(dev)  # [B, Lopt_max]
+    B, Lopt_max = opt_ids.shape
+
+    pad_id = tok.pad_token_id
+    max_len = Lp + Lopt_max
+
+    # 拼成 [B, max_len] 的 batch
+    input_ids_full = torch.full(
+        (B, max_len),
+        pad_id,
+        dtype=torch.long,
+        device=dev,
+    )
+    attn_full = torch.zeros(
+        (B, max_len),
+        dtype=torch.long,
+        device=dev,
+    )
+
+    for i in range(B):
+        Li = int(opt_mask[i].sum().item())
+        input_ids_full[i, :Lp] = pref_ids
+        input_ids_full[i, Lp:Lp+Li] = opt_ids[i, :Li]
+        attn_full[i, :Lp+Li] = 1
+
+    logits = model(input_ids=input_ids_full, attention_mask=attn_full).logits
+    log_probs = torch.log_softmax(logits, dim=-1)
+
+    logps = []
+    for i in range(B):
+        Li = int(opt_mask[i].sum().item())
+        if Li == 0:
+            logps.append(float("-inf"))
+            continue
+        # 第一个选项 token 的概率位置：prefix 最后一个 token 之后
+        pos_indices = torch.arange(Lp - 1, Lp - 1 + Li, device=dev)
+        token_ids_i = opt_ids[i, :Li]
+        token_logps = log_probs[i, pos_indices, token_ids_i]
+        logps.append(float(token_logps.sum().item()))
+    return np.array(logps, dtype=np.float64)
+
+# ---------------- 判别头：correct / incorrect；带缓存 ----------------
+DISC_CACHE = {}
+
+def _disc_cache_key(question: str, answer: str, tau: float):
+    # 简单的 tuple key
+    return (question, answer, float(tau))
+
+@torch.inference_mode()
+def disc_correct_prob(question: str, answer: str, tau: float = 1.0) -> float:
+    """
+    返回 π_D(correct | x, y) 的点估（带 sigmoid 校准）。
+    用 logprobs_for_options + cache，避免重复 forward。
+    """
+    key = _disc_cache_key(question, answer, tau)
+    if key in DISC_CACHE:
+        return DISC_CACHE[key]
+
+    prefix = (
+        f"Question: {question}\n"
+        f"Answer: {answer}\n\n"
+        f"Is this answer correct? Reply with ' correct' or ' incorrect':"
+    )
+
+    lp_vec = logprobs_for_options(prefix, [" correct", " incorrect"])
+    lp_cor, lp_inc = float(lp_vec[0]), float(lp_vec[1])
+
+    z = (lp_cor - lp_inc) / max(tau, 1e-6)
+    p = 1.0 / (1.0 + math.exp(-z))
+    p = float(max(min(p, 0.999), 0.001))
+
+    DISC_CACHE[key] = p
+    return p
+
+# ---------------- SBR（平滑最佳响应）回路（含 competing 压测） ----------------
+def sbr_loop(question, choices, regime="cons",
+             T=T_ITERS, alpha=ALPHA, kappa=KAPPA, beta=BETA_ADV, tau=1.0):
+    """
+    输出：
+      pG, pD: 仍为对 y 的分布（排序用）
+      s_cor: 逐选项的 π_D(correct|x,y)（用于校准与置信度）
+    """
+    C = len(choices)
+
+    # 一次性判别证据：π_D(correct|x, y) for each y
+    s_cor = np.array([disc_correct_prob(question, a, tau=tau) for a in choices], dtype=np.float64)
+    s_cor = np.clip(s_cor, 1e-6, 1 - 1e-6)
+
+    # 初始化策略（对 y 的分布），用于排序的 SBR 更新
+    pG = np.ones(C, dtype=np.float64) / C
+    pD = np.ones(C, dtype=np.float64) / C
+
+    def softmax(x):
+        x = np.array(x, dtype=np.float64)
+        x = x - x.max()
+        e = np.exp(x)
+        return e / e.sum()
+
+    # 用 logit(s_cor) 作为 D 的目标排序依据（仅用于 rank，不作为校准概率）
+    logit = np.log(s_cor) - np.log(1.0 - s_cor)
+
+    for _ in range(max(1, T)):
+        # D：向 softmax(logit) 靠拢（排序视角）
+        pD_tgt = softmax(logit)
+        pD = (1 - kappa) * pD + kappa * pD_tgt
+
+        # G：合作或对抗（对抗用 (1 - pD)^beta 反向跟随）
+        if regime == "cons":
+            pG_tgt = pD
+        else:
+            inv = np.power(np.clip(1.0 - pD, 1e-9, 1.0), beta)
+            pG_tgt = inv / inv.sum()
+
+        pG = (1 - alpha) * pG + alpha * pG_tgt
+
+        # 轻微平滑
+        eps = 1e-3
+        pG = (1 - eps) * pG + eps / C
+        pD = (1 - eps) * pD + eps / C
+        pG = pG / pG.sum()
+        pD = pD / pD.sum()
+
+    return pG, pD, s_cor
+
+# ---------------- ER 排序（无混合；与论文口径一致） ----------------
+def equilibrium_rank(pG, pD, variant="ER-D", topk=RET_K):
+    eps = 1e-12
+    if variant == "ER-D":
+        scores = np.log(np.clip(pD, eps, 1.0))
+    else:  # "ER-G"
+        scores = np.log(np.clip(pG, eps, 1.0))
+
+    order = list(np.argsort(-scores))
+    y_hat = order[0]
+    topk_ids = order[:max(1, topk)]
+    return y_hat, topk_ids, np.array(scores, dtype=np.float64)
+
+# ---------------- 指标 ----------------
+def cg_metrics(records):
+    n = len(records)
+    if n == 0:
+        return {}
+
+    cons_acc = np.mean([1 if r["cons_ok"] else 0 for r in records])
+    comp_acc = np.mean([1 if r["comp_ok"] else 0 for r in records])
+    cg_acc   = float(cons_acc - comp_acc)  # 更小=更鲁棒
+    cg_margin= np.mean([r["s_cons"] - r["s_comp"] for r in records])
+    swap     = np.mean([1 if (r["cons_ok"] and not r["comp_ok"]) else 0 for r in records])
+    ret3     = np.mean([1 if r["topk_hit"] else 0 for r in records])
+
+    def _ece(ps, ys, B=BINS_ECE):
+        ps = np.array(ps)
+        ys = np.array(ys, dtype=int)
+        bins = np.linspace(0,1,B+1)
+        ece = 0.0
+        for b in range(B):
+            lo, hi = bins[b], bins[b+1]
+            idx = (ps >= lo) & (ps < (hi if b < B-1 else hi))
+            if idx.sum() == 0:
+                continue
+            acc  = ys[idx].mean()
+            conf = ps[idx].mean()
+            ece += (idx.sum()/len(ps))*abs(acc-conf)
+        return float(ece)
+
+    def _nll(ps):
+        ps = np.clip(np.array(ps), 1e-6, 1-1e-6)
+        return float(-np.mean(np.log(ps)))
+
+    p_cons = [r["s_cons"] for r in records]
+    p_comp = [r["s_comp"] for r in records]
+    y_cons = [1 if r["cons_ok"] else 0 for r in records]
+    y_comp = [1 if r["comp_ok"] else 0 for r in records]
+
+    ece_c = _ece(p_cons, y_cons)
+    ece_a = _ece(p_comp, y_comp)
+
+    nll_c = _nll([p_cons[i] if y_cons[i] == 1 else 1-p_cons[i] for i in range(n)])
+    nll_a = _nll([p_comp[i] if y_comp[i] == 1 else 1-p_comp[i] for i in range(n)])
+
+    return {
+        "cons_acc": float(cons_acc),
+        "comp_acc": float(comp_acc),
+        "CG_acc":   float(cg_acc),
+        "CG_margin": float(cg_margin),
+        "Swap":     float(swap),
+        "Ret@3":    float(ret3),
+        "ECE_cons": float(ece_c),
+        "ECE_comp": float(ece_a),
+        "ΔECE":     float(ece_a - ece_c),
+        "NLL_cons": float(nll_c),
+        "NLL_comp": float(nll_a),
+        "ΔNLL":     float(nll_a - nll_c),
+    }
+
+def kendall_tau_b(order_a, order_b):
+    ra = {int(v): i for i, v in enumerate(order_a)}
+    rb = {int(v): i for i, v in enumerate(order_b)}
+    keys = list(ra.keys())
+    concord = discord = ties = 0
+    for i in range(len(keys)):
+        for j in range(i+1, len(keys)):
+            da = ra[keys[i]] - ra[keys[j]]
+            db = rb[keys[i]] - rb[keys[j]]
+            if da == 0 or db == 0:
+                ties += 1
+            elif (da > 0 and db > 0) or (da < 0 and db < 0):
+                concord += 1
+            else:
+                discord += 1
+    denom = max(1, concord + discord + ties)
+    return (concord - discord) / denom
+
+def save_reliability_fig(records, out_coop, out_adv, B=BINS_ECE):
+    os.makedirs("figs", exist_ok=True)
+
+    def _plot(ps, ys, path):
+        ps = np.array(ps)
+        ys = np.array(ys, dtype=int)
+        bins = np.linspace(0,1,B+1)
+        accs, confs = [], []
+        for b in range(B):
+            lo, hi = bins[b], bins[b+1]
+            idx = (ps >= lo) & (ps < (hi if b < B-1 else hi))
+            if idx.sum() == 0:
+                accs.append(np.nan)
+                confs.append(np.nan)
+            else:
+                accs.append(ys[idx].mean())
+                confs.append(ps[idx].mean())
+        plt.figure(figsize=(5.6,4.0))
+        plt.plot([0,1],[0,1], linestyle="--")
+        plt.scatter(
+            [c for c in confs if not np.isnan(c)],
+            [a for a in accs  if not np.isnan(a)],
+            s=26,
+        )
+        plt.xlabel("Confidence")
+        plt.ylabel("Empirical accuracy")
+        plt.title(f"Reliability (B={B})")
+        plt.tight_layout()
+        plt.savefig(path)
+        plt.close()
+
+    p_cons = [r["s_cons"] for r in records]
+    y_cons = [1 if r["cons_ok"] else 0 for r in records]
+    p_comp = [r["s_comp"] for r in records]
+    y_comp = [1 if r["comp_ok"] else 0 for r in records]
+
+    _plot(p_cons, y_cons, out_coop)
+    _plot(p_comp, y_comp, out_adv)
+
+# ---------------- 数据加载 ----------------
+def load_arc_easy(n=ARC_N, seed=SEED):
+    ds = load_dataset("ai2_arc", "ARC-Easy")
+    # 论文主表用 test；若不可用则回退 validation/train
+    for split in ["test","validation","train"]:
+        if split in ds:
+            data = ds[split]
+            break
+    rng = np.random.RandomState(seed)
+    idxs = rng.permutation(len(data))[:n]
+    items = []
+    for i in idxs:
+        ex = data[int(i)]
+        stem = ex["question"]
+        ch   = ex["choices"]
+        choices = list(ch["text"])
+        labels  = list(ch["label"])
+        key = ex["answerKey"]           # 'A'...'E'
+        gold = labels.index(key) if key in labels else 0
+        items.append((stem, choices, gold))
+    return items
+
+def load_mmlu_subset_robust(subjects=MMLU_SUBJ, n_per_subj=MMLU_PER):
+    ds = None
+    last_err = None
+    for repo, cfg in [("lukaemon/mmlu","all"), ("cais/mmlu","all")]:
+        try:
+            ds = load_dataset(repo, cfg, split="test")
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    if ds is None:
+        raise RuntimeError(f"Unable to load MMLU mirror: {last_err}")
+
+    ds = ds.filter(lambda ex: ex.get("subject","") in set(subjects))
+    buckets = {s:0 for s in subjects}
+    items = []
+    for ex in ds:
+        s = ex.get("subject","")
+        if s not in buckets or buckets[s] >= n_per_subj:
+            continue
+        stem = ex.get("question") or ex.get("prompt") or ""
+        if "choices" in ex and isinstance(ex["choices"], (list,tuple)):
+            choices = list(ex["choices"])
+        else:
+            choices = [ex.get(k) for k in ["A","B","C","D"] if ex.get(k) is not None]
+        if len(choices) < 2:
+            continue
+        ans = ex.get("answer")
+        if isinstance(ans, str):
+            if ans in ["A","B","C","D"]:
+                gold = ["A","B","C","D"].index(ans)
+            else:
+                gold = choices.index(ans) if ans in choices else 0
+        else:
+            gold = int(ans) if ans is not None else 0
+        items.append((stem, choices, gold))
+        buckets[s] += 1
+    return items
+
+def load_truthfulqa_mc_robust(n=TQA_N, seed=SEED):
+    def _to_str_list(x):
+        if x is None:
+            return []
+        if isinstance(x, (list, tuple)):
+            if len(x) > 0 and isinstance(x[0], dict):
+                out = []
+                for d in x:
+                    if isinstance(d, dict):
+                        if "text" in d and isinstance(d["text"], str):
+                            out.append(d["text"])
+                        elif "answer" in d and isinstance(d["answer"], str):
+                            out.append(d["answer"])
+                return out
+            return [str(t) for t in x if t is not None]
+        if isinstance(x, dict):
+            if "text" in x:
+                return _to_str_list(x["text"])
+            if "choices" in x:
+                return _to_str_list(x["choices"])
+        return [str(x)]
+
+    ds = None
+    for sp in ["test", "validation", "train"]:
+        try:
+            cand = load_dataset("truthful_qa", "multiple_choice", split=sp)
+            if len(cand) > 0:
+                ds = cand
+                break
+        except Exception:
+            continue
+    if ds is None:
+        print("[tqa] could not load any split; returning empty list")
+        return []
+
+    rng = np.random.RandomState(seed)
+    idxs = rng.permutation(len(ds))
+    items = []
+    for i in idxs:
+        ex = ds[int(i)]
+        stem = ex.get("question") or ex.get("query") or ""
+
+        # 优先用 mc2/mc1 结构，否则退化到 choices/label
+        pos = _to_str_list(ex.get("mc2_targets")) or _to_str_list(ex.get("mc1_targets"))
+        neg = _to_str_list(ex.get("mc2_distractors")) or _to_str_list(ex.get("mc1_distractors"))
+
+        if not pos and ("choices" in ex or "options" in ex):
+            choices_field = ex.get("choices") or ex.get("options")
+            choices = _to_str_list(choices_field)
+            label   = ex.get("label") or ex.get("answer") or ex.get("gold")
+            if isinstance(label, str) and label in "ABCDE":
+                gold = "ABCDE".index(label)
+            elif isinstance(label, (int, np.integer)):
+                gold = int(label)
+            else:
+                gold = 0
+            if len(choices) >= 2:
+                items.append((stem, choices[:4], gold))
+            if len(items) >= n:
+                break
+            continue
+
+        base = (pos[:1] if len(pos) > 0 else []) + neg
+        if len(base) < 2:
+            if len(pos) >= 2:
+                base = pos[:2]
+            else:
+                continue
+        take = base[:4] if len(base) >= 4 else base
+        order = list(range(len(take)))
+        rng.shuffle(order)
+        choices = [take[j] for j in order]
+        gold = order.index(0)  # base[0] 为真选项
+        items.append((stem, choices, gold))
+        if len(items) >= n:
+            break
+    return items
+
+# ---------------- 评测（MC） ----------------
+def evaluate_mc_items(items, variant_same=ER_VARIANT, ret_k=RET_K, prefix="dataset"):
+    if not items:
+        print(f"[{prefix}] no items")
+        return {}, (float("nan"), float("nan"), float("nan")), [], None
+
+    recs, taus = [], []
+    for stem, choices, gold in items:
+        # cooperative
+        pG_c, pD_c, s_cor_c = sbr_loop(stem, choices, regime="cons")
+        y_c, topk_c, scores_c = equilibrium_rank(pG_c, pD_c, variant=variant_same, topk=ret_k)
+        cons_ok  = (y_c == gold)
+        # 用 π_D(correct|x, ŷ) 作为 coop 置信度
+        s_cons   = float(np.clip(s_cor_c[y_c], 1e-6, 1-1e-6))
+        order_c  = list(np.argsort(-scores_c))
+
+        # adversarial
+        pG_a, pD_a, s_cor_a = sbr_loop(stem, choices, regime="comp")
+        y_a, topk_a, scores_a = equilibrium_rank(pG_a, pD_a, variant=variant_same, topk=ret_k)
+        comp_ok  = (y_a == gold)
+        s_comp   = float(np.clip(s_cor_a[y_a], 1e-6, 1-1e-6))
+        order_a  = list(np.argsort(-scores_a))
+
+        taus.append(kendall_tau_b(order_c, order_a))
+        recs.append({
+            "cons_ok": cons_ok,
+            "comp_ok": comp_ok,
+            "s_cons":  s_cons,
+            "s_comp":  s_comp,
+            "topk_hit": (gold in topk_a),
+        })
+
+    met = cg_metrics(recs)
+    tau_mean = float(np.nanmean(taus))
+    tau_p5   = float(np.nanpercentile(taus, 5))
+    tau_p95  = float(np.nanpercentile(taus, 95))
+    met["tau_b_mean"], met["tau_b_p5"], met["tau_b_p95"] = tau_mean, tau_p5, tau_p95
+
+    os.makedirs("figs", exist_ok=True)
+    save_reliability_fig(recs, f"figs/ece_{prefix}_coop.pdf", f"figs/ece_{prefix}_adv.pdf", B=BINS_ECE)
+    return met, (tau_mean, tau_p5, tau_p95), recs, f"figs/ece_{prefix}_coop.pdf"
+
+def show_block(name, D):
+    print("\n---------------- " + name + " ----------------")
+    if not D:
+        print("no metrics")
+        return
+
+    def fmt(v, p=4):
+        try:
+            if v is None:
+                return "--"
+            if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+                return "--"
+            return f"{v:.{p}f}" if isinstance(v, (float, np.floating)) else str(v)
+        except:
+            return "--"
+
+    print(f"cons_acc\t{fmt(D.get('cons_acc'))}")
+    print(f"comp_acc\t{fmt(D.get('comp_acc'))}")
+    print(f"CG_acc\t{fmt(D.get('CG_acc'))}    <-- smaller is more robust")
+    print(f"CG_margin\t{fmt(D.get('CG_margin'))}")
+    print(f"Swap\t{fmt(D.get('Swap'))}")
+    print(f"Ret@3\t{fmt(D.get('Ret@3'))}")
+    print(f"ΔECE\t{fmt(D.get('ΔECE'))}")
+    print(f"ΔNLL\t{fmt(D.get('ΔNLL'))}")
+    print(f"tau_b_mean\t{fmt(D.get('tau_b_mean'))}")
+    print(f"tau_b_p5\t{fmt(D.get('tau_b_p5'))}")
+    print(f"tau_b_p95\t{fmt(D.get('tau_b_p95'))}")
+
+# ---------------- 主表基线：G / MI / SC / D / ER-G / ER-D ----------------
+def gen_score_G(question, choices):
+    pref = f"Question: {question}\nAnswer: "
+    return logprobs_for_options(pref, choices)
+
+def gen_score_MI(question, choices):
+    # PMI: log P(y|x) - log P(y)
+    pref_ctx = f"Question: {question}\nAnswer: "
+    pref_un  = "Answer: "
+    lp_ctx = logprobs_for_options(pref_ctx, choices)
+    lp_un  = logprobs_for_options(pref_un,  choices)
+    return lp_ctx - lp_un
+
+def gen_score_SC(question, choices):
+    # Self-Contrastive: 正确 vs 错误 两种生成式提示差分
+    pref_cor = f"Question: {question}\nWhich option is correct?\nAnswer: "
+    pref_inc = f"Question: {question}\nWhich option is incorrect?\nAnswer: "
+    lp_cor = logprobs_for_options(pref_cor, choices)
+    lp_inc = logprobs_for_options(pref_inc, choices)
+    return lp_cor - lp_inc
+
+def disc_score_D(question, choices):
+    # 判别式：logit(π_D(correct|x,y))，与 p 同序；这里重用带 cache 的 disc_correct_prob
+    ps = np.array([disc_correct_prob(question, c) for c in choices], dtype=np.float64)
+    ps = np.clip(ps, 1e-6, 1-1e-6)
+    return np.log(ps) - np.log(1-ps)
+
+def top1_acc_from_scores(items, scorer_fn):
+    ok = 0
+    for stem, choices, gold in items:
+        sc = scorer_fn(stem, choices)
+        yhat = int(np.argmax(sc))
+        ok += int(yhat == gold)
+    return ok / max(1, len(items))
+
+def run_table_like(items, tag):
+    res = {}
+    res["G"]    = top1_acc_from_scores(items, gen_score_G)
+    res["MI"]   = top1_acc_from_scores(items, gen_score_MI)
+    res["SC"]   = top1_acc_from_scores(items, gen_score_SC)
+    res["D"]    = top1_acc_from_scores(items, disc_score_D)
+
+    # ER 两列（与论文相同口径：不混加；同一候选集；SBR 搜索）
+    def acc_er(items_, variant):
+        ok = 0
+        for stem, choices, gold in items_:
+            pG, pD, _ = sbr_loop(stem, choices, regime="cons")  # coop/主表
+            yhat, _, _ = equilibrium_rank(pG, pD, variant=variant, topk=1)
+            ok += int(yhat == gold)
+        return ok / max(1, len(items_))
+
+    res["ER-G"] = acc_er(items, "ER-G")
+    res["ER-D"] = acc_er(items, "ER-D")
+
+    print(f"\n== {tag} (Top-1 Accuracy, %) ==")
+    heads = ["G","MI","SC","D","ER-G","ER-D"]
+    print(" | ".join([f"{h:>6s}" for h in heads]))
+    print(" | ".join([f"{100*res[h]:6.1f}" for h in heads]))
+    return res
+
+def latex_row(domain, model_name, R):
+    def f(v):
+        return f"{100*v:.1f}" if isinstance(v, (float, np.floating)) else "--"
+    return (
+        f"{domain} & {model_name} & -- & {f(R['G'])} & {f(R['MI'])} & {f(R['SC'])} & "
+        f"{f(R['D'])} & {f(R['ER-G'])} & {f(R['ER-D'])} \\\\"
+    )
+
+# ---------------- 跑全部 ----------------
+
+free_cuda()
+
+print("\n=== Loading datasets ===")
+arc_items = load_arc_easy(n=ARC_N)
+mmlu_items = load_mmlu_subset_robust()
+tqa_items  = load_truthfulqa_mc_robust()
+print(f"ARC-Easy: {len(arc_items)} | MMLU(mini): {len(mmlu_items)} | TQA-MC: {len(tqa_items)}")
+
+# 主表（G / MI / SC / D / ER-G / ER-D）
+tbl_arc = run_table_like(arc_items,  "ARC-Easy")
+tbl_mml = run_table_like(mmlu_items, "MMLU (mini)")
+tbl_tqa = run_table_like(tqa_items,  "TruthfulQA-MC (mini)")
+
+# CG 面板：主表还是用 ER_VARIANT，这里单独用 ER-G 看鲁棒性
+CG_VARIANT = "ER-G"  # 用 ER-G 来做 CG panel（coop/adv 对比）
+
+print("\n=== Evaluating CG Panel (coop/adv) using", CG_VARIANT, "===")
+arc_met, arc_tau, arc_records, _ = evaluate_mc_items(
+    arc_items, variant_same=CG_VARIANT, prefix="arc_easy"
+)
+mml_met, mml_tau, _, _ = evaluate_mc_items(
+    mmlu_items, variant_same=CG_VARIANT, prefix="mmlu_mini"
+)
+tqa_met, tqa_tau, _, _ = evaluate_mc_items(
+    tqa_items, variant_same=CG_VARIANT, prefix="tqa_mc_mini"
+)
+
+show_block("ARC-Easy",      arc_met)
+show_block("MMLU (mini)",   mml_met)
+show_block("TruthfulQA-MC", tqa_met)
+
+# ---------------- LaTeX：主表（与论文表头一致，G* 留空） ----------------
+print("\n===== LaTeX: Main Table (G/MI/SC/D/ER-G/ER-D) =====")
+print("\\begin{tabular}{l l c c c c c c c}\\toprule")
+print("Domain & Model & G$^*$ & G & MI & SC & D & ER-G & ER-D \\\\\\midrule")
+print(latex_row("ARC Easy",            "Llama-2-7B", tbl_arc))
+print(latex_row("MMLU (mini)",         "Llama-2-7B", tbl_mml))
+print(latex_row("TruthfulQA-MC (mini)","Llama-2-7B", tbl_tqa))
+print("\\bottomrule\\end{tabular}")
+
+# ---------------- LaTeX：CG 面板（ΔECE/ΔNLL/τ_b） ----------------
+def _fmt(v, p=4):
+    try:
+        if v is None:
+            return "--"
+        if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
+            return "--"
+        return f"{v:.{p}f}" if isinstance(v, (float, np.floating)) else str(v)
+    except:
+        return "--"
+
+def row_cg(name, D):
+    if not D:
+        return f"{name} & -- & -- & -- & -- \\\\"
+    swp = 100 * D.get("Swap") if isinstance(D.get("Swap"), (float, int, np.floating)) else None
+    ret = 100 * D.get("Ret@3") if isinstance(D.get("Ret@3"), (float, int, np.floating)) else None
+    return f"{name} & {_fmt(D.get('CG_acc'))} & {_fmt(D.get('CG_margin'))} & {_fmt(swp)} & {_fmt(ret)} \\\\"
+
+def row_cal(name, D):
+    if not D:
+        return f"{name} & -- & -- \\\\"
+    return f"{name} & {_fmt(D.get('ΔECE'))} & {_fmt(D.get('ΔNLL'))} \\\\"
+
+def tau_row(name, D):
+    if not D:
+        return f"{name} & -- & -- & -- \\\\"
+    return f"{name} & {_fmt(D.get('tau_b_mean'))} & {_fmt(D.get('tau_b_p5'))} & {_fmt(D.get('tau_b_p95'))} \\\\"
+
+latex = []
+latex.append("% ====== CG Panel (auto-generated) ======")
+latex.append("\\subsection{Consistency Gap Panel (mini, 7B, ER-G)}")
+latex.append("\\begin{table}[H]\\centering")
+latex.append("\\caption{Lower is better for $CG_{\\text{acc}}$, $CG_{\\text{margin}}$, and Swap; higher is better for Ret@3.}")
+latex.append("\\begin{tabular}{@{}lcccc@{}}\\toprule")
+latex.append("\\textbf{Dataset} & $CG_{\\text{acc}}$ & $CG_{\\text{margin}}$ & Swap (\\%) & Ret@3 (\\%)\\\\\\midrule")
+latex.append(row_cg("ARC-Easy",      arc_met))
+latex.append(row_cg("MMLU (mini)",   mml_met))
+latex.append(row_cg("TruthfulQA-MC", tqa_met))
+latex.append("\\bottomrule\\end{tabular}\\end{table}")
+
+latex.append("\\begin{table}[H]\\centering")
+latex.append("\\caption{$\\Delta$ECE $=$ ECE$_{\\text{adv}}{-}$ECE$_{\\text{coop}}$; similarly for $\\Delta$NLL.}")
+latex.append("\\begin{tabular}{@{}lcc@{}}\\toprule")
+latex.append("\\textbf{Dataset} & $\\Delta$ECE ($B{=}15$) & $\\Delta$NLL\\\\\\midrule")
+latex.append(row_cal("ARC-Easy",      arc_met))
+latex.append(row_cal("MMLU (mini)",   mml_met))
+latex.append(row_cal("TruthfulQA-MC", tqa_met))
+latex.append("\\bottomrule\\end{tabular}\\end{table}")
+
+latex.append("\\begin{table}[H]\\centering")
+latex.append("\\caption{Kendall's $\\tau_b$ between rankings under cooperative vs.~adversarial.}")
+latex.append("\\begin{tabular}{@{}lccc@{}}\\toprule")
+latex.append("\\textbf{Dataset} & mean & 5th pct & 95th pct\\\\\\midrule")
+latex.append(tau_row("ARC-Easy",      arc_met))
+latex.append(tau_row("MMLU (mini)",   mml_met))
+latex.append(tau_row("TruthfulQA-MC", tqa_met))
+latex.append("\\bottomrule\\end{tabular}\\end{table}")
+
+print("\n===== LaTeX: CG Panel =====\n" + "\n".join(latex))
+
+print("\n[Saved figures]")
+print("  - ARC-Easy: figs/ece_arc_easy_coop.pdf, figs/ece_arc_easy_adv.pdf")
+print("  - MMLU:     figs/ece_mmlu_mini_coop.pdf, figs/ece_mmlu_mini_adv.pdf")
+print("  - TQA-MC:   figs/ece_tqa_mc_mini_coop.pdf, figs/ece_tqa_mc_mini_adv.pdf")
